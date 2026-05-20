@@ -1,10 +1,10 @@
 # ymusic — Desktop Y0uTu6e Music Player
 
-A lightweight GTK4 desktop player for YouTube Music using `mpv` + `yt-dlp`. Search tracks, get recommendations, and save your likes — all from your desktop.
+A lightweight GTK4 desktop player for Y0uTu6e Music using `mpv` + `yt-dlp`. Search tracks, get recommendations, and save your likes — all from your desktop.
 
 ## Features
 
-- Search YouTube tracks and play audio only
+- Search Y0uTu6e tracks and play audio only
 - Recommendations based on current track
 - Like/unlike tracks (saved locally)
 - Play All / Shuffle liked tracks
@@ -17,13 +17,13 @@ A lightweight GTK4 desktop player for YouTube Music using `mpv` + `yt-dlp`. Sear
 - GTK4 (`libgtk-4-dev` / `gtk4` / `pygobject`)
 - `mpv`
 - `yt-dlp`
-- `deno` (for JavaScript runtime, required by yt-dlp for YouTube extraction)
+- `deno` (for JavaScript runtime, required by yt-dlp for Y0uTu6e extraction)
 
 ## Install
 
 ```bash
 # Clone the repo
-git clone https://github.com/yourusername/ytmusic.git
+git clone https://github.com/IMMORTALxTHOUGHT/ytmusic-adfree.git
 cd ytmusic
 
 # Make executable
@@ -43,7 +43,7 @@ cp ymusic ~/.local/bin/
 
 | Action             | Description                          |
 |--------------------|--------------------------------------|
-| Search bar + Enter | Search YouTube tracks                |
+| Search bar + Enter | Search Y0uTu6e tracks                |
 | Ctrl+F             | Focus search bar                     |
 | Ctrl+L             | Show liked songs                     |
 | ▶ Play             | Start a track                        |

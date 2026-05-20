@@ -1,0 +1,1054 @@
+#!/usr/bin/env python3
+"""
+ymusic - Y0uTu6e Music Desktop Player
+GTK4 GUI using mpv + yt-dlp with recommendations and likes.
+
+Keyboard:
+  Ctrl+F  Focus search
+  Ctrl+L  Show liked songs
+"""
+
+import subprocess, json, os, sys, threading, time, signal, socket, random
+
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gtk, Gdk, GLib
+
+CACHE = Path.home() / ".cache" / "ymusic"
+CACHE.mkdir(parents=True, exist_ok=True)
+LIKED_FILE = CACHE / "liked.json"
+
+
+def run_cmd(cmd, timeout=30, retries=2, cancel=None):
+    env = os.environ.copy()
+    env["PATH"] = os.path.expanduser("~/.deno/bin") + ":" + env.get("PATH", "")
+    for i in range(retries):
+        if cancel and cancel.is_set():
+            return "", "", -1
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if cancel and cancel.is_set():
+                proc.kill()
+                return "", "", -1
+            try:
+                stdout, stderr = proc.communicate(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        else:
+            proc.kill()
+            proc.communicate()
+            continue
+        if proc.returncode == 0 or ("429" not in stderr and "Too Many" not in stderr):
+            return stdout, stderr, proc.returncode
+        if i < retries - 1:
+            for _ in range(4):
+                if cancel and cancel.is_set():
+                    return "", "", -1
+                time.sleep(0.5)
+    return "", "Failed", 1
+
+
+_search_cache = {}
+
+_YT_OPTS = []
+
+def search_yt(query, limit=10):
+    key = f"{query}:{limit}"
+    if key in _search_cache:
+        ts, cached = _search_cache[key]
+        if time.time() - ts < 120:
+            return cached
+    cmd = ["yt-dlp"] + _YT_OPTS + ["--dump-json", "--flat-playlist",
+           "-I", f"1:{limit}", f"ytsearch{limit}:{query}"]
+    out, _, code = run_cmd(cmd, 60, 1)
+    results = []
+    for line in out.strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+            results.append({"id": d.get("id",""), "title": d.get("title","Unknown"),
+                            "uploader": d.get("uploader","Unknown"),
+                            "duration": d.get("duration",0), "views": d.get("view_count",0)})
+        except:
+            pass
+    _search_cache[key] = (time.time(), results)
+    return results
+
+
+_recs_cache = {}
+_stream_url_cache = {}
+
+def get_related(query, video_id, limit=10, cancel=None):
+    key = video_id
+    if key in _recs_cache:
+        ts, cached = _recs_cache[key]
+        if time.time() - ts < 300:
+            return cached
+    mix_url = f"https://youtube.com/watch?v={video_id}&list=RDMM{video_id}"
+    cmd = ["yt-dlp"] + _YT_OPTS + ["--dump-json", "--flat-playlist",
+           "-I", f"1:{limit+2}", mix_url]
+    out, _, code = run_cmd(cmd, 30, 1, cancel=cancel)
+    if cancel and cancel.is_set():
+        return []
+    results = []
+    for line in out.strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+            if d.get("_type") != "url" or not d.get("id") or d["id"] == video_id:
+                continue
+            results.append({"id": d["id"], "title": d.get("title","Unknown"),
+                            "uploader": d.get("uploader") or d.get("channel","Unknown"),
+                            "duration": d.get("duration",0), "views": d.get("view_count",0)})
+        except:
+            pass
+    results = results[:limit]
+    _recs_cache[key] = (time.time(), results)
+    return results
+
+
+def get_stream_url(video_id, cancel=None):
+    if video_id in _stream_url_cache:
+        return _stream_url_cache[video_id]
+    cmd = ["yt-dlp"] + _YT_OPTS + ["-g", "--format", "bestaudio",
+           f"https://youtu.be/{video_id}"]
+    out, _, code = run_cmd(cmd, 30, 2, cancel=cancel)
+    if cancel and cancel.is_set():
+        return ""
+    if code == 0 and "googlevideo.com" in out:
+        url = out.strip()
+        _stream_url_cache[video_id] = url
+        return url
+    return ""
+
+
+def fmt_dur(s):
+    if not s:
+        return ""
+    m, s = divmod(int(s), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def fmt_views(n):
+    if not n:
+        return ""
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}K"
+    return str(n)
+
+
+def load_liked():
+    if LIKED_FILE.exists():
+        return json.loads(LIKED_FILE.read_text())
+    return []
+
+
+def save_liked(tracks):
+    LIKED_FILE.write_text(json.dumps(tracks, indent=2))
+
+
+def is_liked(vid):
+    return any(t["id"] == vid for t in load_liked())
+
+
+def toggle_like(track):
+    liked = load_liked()
+    if any(t["id"] == track["id"] for t in liked):
+        liked = [t for t in liked if t["id"] != track["id"]]
+        save_liked(liked)
+        return False
+    liked.insert(0, track)
+    save_liked(liked)
+    return True
+
+
+
+
+
+class PlayerManager:
+    """Thread-safe single-track player. Only one track plays at a time."""
+
+    def __init__(self, on_state_change=None, on_position=None):
+        self._lock = threading.Lock()
+        self._proc = None
+        self._cancel = threading.Event()
+        self._track = None
+        self._state = "stopped"  # stopped | loading | playing | ended | failed
+        self._on_state = on_state_change
+        self._on_position = on_position
+
+        self._ipc_path = None
+        self._position = 0.0
+        self._duration = 0.0
+        self._paused = False
+        self._volume = 100
+        self._loop = "none"
+        self._seeking = False
+        self._queue = []
+
+    @property
+    def track(self):
+        return self._track
+
+    @property
+    def state(self):
+        return self._state
+
+    @property
+    def paused(self):
+        return self._paused
+
+    @property
+    def position(self):
+        return self._position
+
+    @property
+    def duration(self):
+        return self._duration
+
+    @property
+    def volume(self):
+        return self._volume
+
+    @property
+    def loop(self):
+        return self._loop
+
+    @property
+    def queue(self):
+        return list(self._queue)
+
+    # ── IPC helpers ──
+
+    def _send_ipc(self, cmd):
+        if not self._ipc_path or not os.path.exists(self._ipc_path):
+            return None
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        try:
+            sock.connect(self._ipc_path)
+            sock.sendall(json.dumps(cmd).encode() + b"\n")
+            resp = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
+                if b"\n" in resp:
+                    break
+            return json.loads(resp.decode())
+        except:
+            return None
+        finally:
+            sock.close()
+
+    def _start_polling(self, cancel):
+        def poll():
+            sock = None
+            try:
+                while not cancel.is_set():
+                    if self._ipc_path and os.path.exists(self._ipc_path):
+                        try:
+                            if sock is None:
+                                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                                sock.settimeout(2)
+                                sock.connect(self._ipc_path)
+                            sock.sendall(json.dumps({"command": ["get_property", "time-pos"]}).encode() + b"\n")
+                            resp = b""
+                            while True:
+                                chunk = sock.recv(4096)
+                                if not chunk:
+                                    break
+                                resp += chunk
+                                if b"\n" in resp:
+                                    break
+                            if resp:
+                                d = json.loads(resp.decode())
+                                if "data" in d and d["data"] is not None:
+                                    self._position = d["data"]
+                                    if not self._seeking and self._on_position:
+                                        GLib.idle_add(self._on_position, self._position)
+                        except (ConnectionRefusedError, FileNotFoundError, BrokenPipeError, OSError):
+                            if sock:
+                                try:
+                                    sock.close()
+                                except:
+                                    pass
+                            sock = None
+                        except:
+                            pass
+                    with self._lock:
+                        p = self._proc
+                    if p and p.poll() is not None:
+                        break
+                    for _ in range(10):
+                        if cancel.is_set():
+                            return
+                        time.sleep(0.05)
+            finally:
+                if sock:
+                    try:
+                        sock.close()
+                    except:
+                        pass
+
+        threading.Thread(target=poll, daemon=True).start()
+
+    def _cleanup_ipc(self):
+        path = self._ipc_path
+        self._ipc_path = None
+        self._duration = 0
+        self._position = 0
+        if path and os.path.exists(path):
+            try:
+                os.unlink(path)
+            except:
+                pass
+
+    # ── Player control ──
+
+    def stop(self):
+        self._cancel.set()
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+        if proc:
+            try:
+                proc.send_signal(signal.SIGTERM)
+                proc.kill()
+            except:
+                pass
+        self._cleanup_ipc()
+        self._track = None
+        self._paused = False
+        self._set_state("stopped")
+
+    def play(self, track):
+        self.stop()
+        cancel = threading.Event()
+        self._cancel = cancel
+        self._track = track
+        self._set_state("loading")
+        threading.Thread(target=self._do_play, args=(track, cancel), daemon=True).start()
+
+    def play_next_in_queue(self):
+        with self._lock:
+            if not self._queue:
+                return False
+            track = self._queue.pop(0)
+        self._cancel.set()
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+        if proc:
+            try:
+                proc.send_signal(signal.SIGTERM)
+                proc.kill()
+            except:
+                pass
+        self._cleanup_ipc()
+        self._paused = False
+        cancel = threading.Event()
+        self._cancel = cancel
+        self._track = track
+        self._set_state("loading")
+        threading.Thread(target=self._do_play, args=(track, cancel), daemon=True).start()
+        return True
+
+    def set_queue(self, tracks):
+        self._queue = list(tracks)
+
+    def _do_play(self, track, cancel):
+        url = get_stream_url(track["id"], cancel)
+        if cancel.is_set():
+            return
+        if not url:
+            self._set_state("failed")
+            return
+        ipc = f"/tmp/ymusic-{random.randint(10000,99999)}.sock"
+        self._ipc_path = ipc
+        cmd = ["mpv", f"--input-ipc-server={ipc}", "--no-video", "--no-terminal",
+               url]
+        env = os.environ.copy()
+        env["PATH"] = os.path.expanduser("~/.deno/bin") + ":" + env.get("PATH", "")
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        with self._lock:
+            self._proc = proc
+        dur = track.get("duration", 0) or 0
+        self._duration = dur
+        self._start_polling(cancel)
+        self._set_state("playing")
+        proc.wait()
+        with self._lock:
+            self._proc = None
+        self._cleanup_ipc()
+        if cancel.is_set():
+            return
+        self._set_state("ended")
+
+    def seek(self, pos):
+        self._send_ipc({"command": ["set_property", "time-pos", float(pos)]})
+
+    def toggle_pause(self):
+        self._paused = not self._paused
+        self._send_ipc({"command": ["set_property", "pause", self._paused]})
+        return self._paused
+
+    def set_volume(self, vol):
+        self._volume = vol
+        self._send_ipc({"command": ["set_property", "volume", vol]})
+
+    def set_loop(self, active):
+        self._loop = "yes" if active else "no"
+        self._send_ipc({"command": ["set_property", "loop-file", self._loop]})
+
+    def _set_state(self, state):
+        self._state = state
+        if self._on_state:
+            GLib.idle_add(self._on_state, state)
+
+
+CSS = b"""
+window { background: #1a1b26; }
+entry { background: #1f2335; color: #c0caf5; border: 1px solid #3b4261; border-radius: 6px; }
+entry:focus { border-color: #7aa2f7; }
+.playing-title { font-size: 18px; font-weight: bold; color: #c0caf5; }
+.playing-artist { font-size: 13px; color: #565f89; }
+.playing-dur { font-size: 12px; color: #41496b; }
+.result-title { font-size: 13px; font-weight: bold; color: #c0caf5; }
+.result-sub { font-size: 11px; color: #565f89; }
+.rec-title { font-size: 12px; font-weight: bold; color: #c0caf5; }
+.rec-sub { font-size: 10px; color: #565f89; }
+.status-text { font-size: 11px; color: #41496b; }
+.header-label { font-size: 14px; font-weight: bold; color: #c0caf5; padding: 4px; }
+button { background: #3b4261; color: #c0caf5; border-radius: 6px; border: none; padding: 6px 12px; }
+button:hover { background: #4f5577; }
+.playing-label {
+  font-size: 11px; color: #7aa2f7; font-weight: bold;
+  border: 1px solid #7aa2f7; border-radius: 4px; padding: 2px 6px;
+}
+.loading-label {
+  font-size: 11px; color: #e0af68; font-weight: bold;
+  border: 1px solid #e0af68; border-radius: 4px; padding: 2px 6px;
+}
+.play-btn { background: #7aa2f7; color: #1a1b26; font-weight: bold; }
+.play-btn:hover { background: #89b4ff; }
+.like-btn { background: transparent; color: #f7768e; border: 1px solid #3b4261; }
+.like-btn:hover { background: #2f3347; }
+.liked-btn { background: #f7768e; color: #1a1b26; font-weight: bold; }
+.liked-btn:hover { background: #ff9eb0; }
+.loop-btn { background: transparent; border: 1px solid #3b4261; min-width: 36px; }
+.loop-btn:checked { background: #7aa2f7; color: #1a1b26; border-color: #7aa2f7; }
+.play-pause-btn { min-width: 42px; font-size: 16px; }
+.ctrl-vol { min-width: 24px; }
+scale trough { background: #3b4261; border-radius: 4px; min-height: 6px; }
+scale highlight { background: #7aa2f7; border-radius: 4px; }
+"""
+
+
+class YMusicApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="com.ymusic.app")
+        self.current_results = []
+        self.current_track = None
+        self.current_recs = []
+        self.liked_tracks = load_liked()
+        self.player = PlayerManager(
+            on_state_change=self._on_player_state,
+            on_position=self._on_position_update,
+        )
+        self._play_rows_res = {}
+        self._play_rows_recs = {}
+        self._seek_timeout = 0
+
+    def do_activate(self):
+        win = Gtk.ApplicationWindow(application=self)
+        win.set_title("ymusic")
+        win.set_default_size(1100, 680)
+
+        css = Gtk.CssProvider()
+        css.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        # === Top bar ===
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        top.set_margin_top(8); top.set_margin_start(8); top.set_margin_end(8)
+
+        self.search_entry = Gtk.Entry()
+        self.search_entry.set_placeholder_text("Search songs, artists, or albums...")
+        self.search_entry.set_hexpand(True)
+        self.search_entry.connect("activate", lambda e: self.do_search())
+        top.append(self.search_entry)
+
+        sbtn = Gtk.Button(label="Search")
+        sbtn.add_css_class("play-btn")
+        sbtn.connect("clicked", lambda b: self.do_search())
+        top.append(sbtn)
+
+        lbtn = Gtk.Button(label="♥ Liked")
+        lbtn.connect("clicked", lambda b: self.show_liked())
+        top.append(lbtn)
+
+     
+        vbox.append(top)
+
+        # === Middle: 3-pane ===
+        mid = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        mid.set_margin_top(6); mid.set_margin_start(8); mid.set_margin_end(8)
+        mid.set_vexpand(True)
+
+        # Left: Results
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        left.set_hexpand(True); left.set_vexpand(True)
+
+        self.results_header = Gtk.Label(label="Results")
+        self.results_header.set_halign(Gtk.Align.START)
+        self.results_header.add_css_class("header-label")
+        left.append(self.results_header)
+
+        self.view_toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.view_toolbar.set_margin_start(4); self.view_toolbar.set_margin_end(4)
+        self.view_toolbar.set_margin_bottom(4)
+        self.view_toolbar.set_visible(False)
+
+        self.play_all_btn = Gtk.Button(label="▶ Play All")
+        self.play_all_btn.add_css_class("play-btn")
+        self.play_all_btn.connect("clicked", lambda b: self._play_all_liked())
+        self.view_toolbar.append(self.play_all_btn)
+
+        self.shuffle_btn = Gtk.Button(label="🔀 Shuffle")
+        self.shuffle_btn.add_css_class("play-btn")
+        self.shuffle_btn.connect("clicked", lambda b: self._shuffle_liked())
+        self.view_toolbar.append(self.shuffle_btn)
+
+        left.append(self.view_toolbar)
+
+        swl = Gtk.ScrolledWindow()
+        swl.set_vexpand(True)
+        swl.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
+        self.results_list = Gtk.ListBox()
+        self.results_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        swl.set_child(self.results_list)
+        left.append(swl)
+        mid.append(left)
+
+        # Center: Now Playing
+        center = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        center.set_hexpand(True); center.set_vexpand(True)
+
+        npf = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        npf.set_vexpand(True)
+        npf.set_valign(Gtk.Align.CENTER)
+        npf.set_halign(Gtk.Align.CENTER)
+        npf.set_margin_start(20); npf.set_margin_end(20)
+
+        self.np_title = Gtk.Label(label="Select a track to play")
+        self.np_title.add_css_class("playing-title")
+        self.np_title.set_wrap(True)
+        self.np_title.set_max_width_chars(30)
+        npf.append(self.np_title)
+
+        self.np_artist = Gtk.Label(label="")
+        self.np_artist.add_css_class("playing-artist")
+        npf.append(self.np_artist)
+
+        self.np_dur = Gtk.Label(label="")
+        self.np_dur.add_css_class("playing-dur")
+        npf.append(self.np_dur)
+
+        br = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        br.set_halign(Gtk.Align.CENTER)
+        br.set_margin_top(12)
+
+        self.like_btn = Gtk.Button(label="♡ Like")
+        self.like_btn.add_css_class("like-btn")
+        self.like_btn.set_sensitive(False)
+        self.like_btn.connect("clicked", lambda b: self._toggle_like_current())
+        br.append(self.like_btn)
+
+        self.stop_btn = Gtk.Button(label="⏹ Stop")
+        self.stop_btn.set_sensitive(False)
+        self.stop_btn.connect("clicked", lambda b: self.stop_playback())
+        br.append(self.stop_btn)
+
+        npf.append(br)
+        center.append(npf)
+        mid.append(center)
+
+        # Right: Recommendations
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        right.set_hexpand(True); right.set_vexpand(True)
+
+        self.recs_header = Gtk.Label(label="Recommendations")
+        self.recs_header.set_halign(Gtk.Align.START)
+        self.recs_header.add_css_class("header-label")
+        right.append(self.recs_header)
+
+        swr = Gtk.ScrolledWindow()
+        swr.set_vexpand(True)
+        swr.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
+        self.recs_list = Gtk.ListBox()
+        self.recs_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        swr.set_child(self.recs_list)
+        right.append(swr)
+        mid.append(right)
+
+        vbox.append(mid)
+
+        # === Bottom: Control bar ===
+        ctrl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        ctrl.set_margin_start(8); ctrl.set_margin_end(8); ctrl.set_margin_top(2)
+
+        self.prev_btn = Gtk.Button(label="⏮")
+        self.prev_btn.set_tooltip_text("Restart / Previous")
+        self.prev_btn.add_css_class("play-pause-btn")
+        self.prev_btn.set_sensitive(False)
+        self.prev_btn.connect("clicked", lambda b: self._prev_track())
+        ctrl.append(self.prev_btn)
+
+        self.play_pause_btn = Gtk.Button(label="▶")
+        self.play_pause_btn.set_sensitive(False)
+        self.play_pause_btn.set_tooltip_text("Play / Pause")
+        self.play_pause_btn.add_css_class("play-pause-btn")
+        self.play_pause_btn.connect("clicked", lambda b: self._toggle_play_pause())
+        ctrl.append(self.play_pause_btn)
+
+        self.next_btn = Gtk.Button(label="⏭")
+        self.next_btn.set_tooltip_text("Next track")
+        self.next_btn.add_css_class("play-pause-btn")
+        self.next_btn.set_sensitive(False)
+        self.next_btn.connect("clicked", lambda b: self._next_track())
+        ctrl.append(self.next_btn)
+
+        self.time_label = Gtk.Label(label="0:00")
+        self.time_label.add_css_class("status-text")
+        ctrl.append(self.time_label)
+
+        self.seek_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL)
+        self.seek_scale.set_hexpand(True)
+        self.seek_scale.set_range(0, 1)
+        self.seek_scale.set_draw_value(False)
+        self.seek_scale.set_sensitive(False)
+        self.seek_scale.connect("change-value", self._on_seek)
+        ctrl.append(self.seek_scale)
+
+        self.dur_label = Gtk.Label(label="0:00")
+        self.dur_label.add_css_class("status-text")
+        ctrl.append(self.dur_label)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        sep.set_margin_start(4); sep.set_margin_end(4)
+        ctrl.append(sep)
+
+        self.vol_icon = Gtk.Label(label="🔊")
+        self.vol_icon.add_css_class("ctrl-vol")
+        ctrl.append(self.vol_icon)
+
+        self.vol_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL)
+        self.vol_scale.set_range(0, 100)
+        self.vol_scale.set_value(100)
+        self.vol_scale.set_draw_value(False)
+        self.vol_scale.set_size_request(90, -1)
+        self.vol_scale.connect("change-value", self._on_volume)
+        ctrl.append(self.vol_scale)
+
+        self.loop_btn = Gtk.ToggleButton(label="🔂")
+        self.loop_btn.set_tooltip_text("Repeat one")
+        self.loop_btn.add_css_class("loop-btn")
+        self.loop_btn.connect("toggled", lambda b: self.player.set_loop(b.get_active()))
+        ctrl.append(self.loop_btn)
+
+        vbox.append(ctrl)
+
+        # === Bottom: Status ===
+        bot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        bot.set_margin_top(4); bot.set_margin_start(8); bot.set_margin_end(8); bot.set_margin_bottom(8)
+
+        self.status_label = Gtk.Label(label="Ready")
+        self.status_label.set_halign(Gtk.Align.START)
+        self.status_label.add_css_class("status-text")
+        bot.append(self.status_label)
+        vbox.append(bot)
+
+        win.set_child(vbox)
+
+        kc = Gtk.EventControllerKey()
+        kc.connect("key-pressed", self.on_key)
+        win.add_controller(kc)
+
+        win.connect("close-request", lambda w: (self.player.stop(), False)[1])
+
+        win.present()
+        self.win = win
+        self.show_liked()
+
+    def on_key(self, ctrl, keyval, keycode, state):
+        if state & Gdk.ModifierType.CONTROL_MASK:
+            if keyval == Gdk.KEY_f:
+                self.search_entry.grab_focus()
+                return True
+            if keyval == Gdk.KEY_l:
+                self.show_liked()
+                return True
+        return False
+
+    def set_status(self, text):
+        self.status_label.set_label(text)
+
+    def clear_list(self, lb):
+        if lb is self.results_list:
+            self._play_rows_res.clear()
+        else:
+            self._play_rows_recs.clear()
+        row = lb.get_first_child()
+        while row:
+            nxt = row.get_next_sibling()
+            lb.remove(row)
+            row = nxt
+
+    # ── Player state callback (called from PlayerManager thread via GLib.idle_add) ──
+
+    def _on_player_state(self, state):
+        if state == "loading":
+            self.stop_btn.set_sensitive(True)
+            self.play_pause_btn.set_sensitive(False)
+            self.play_pause_btn.set_label("▶")
+            self.seek_scale.set_sensitive(False)
+            self.prev_btn.set_sensitive(False)
+            self.next_btn.set_sensitive(False)
+            self.set_status("Loading stream...")
+            self.np_dur.set_label("Loading...")
+            self._refresh_all_play_buttons()
+        elif state == "playing":
+            track = self.player.track
+            if not track:
+                return
+            self.stop_btn.set_sensitive(True)
+            self.like_btn.set_sensitive(True)
+            self.play_pause_btn.set_sensitive(True)
+            self.play_pause_btn.set_label("⏸" if not self.player.paused else "▶")
+            self.prev_btn.set_sensitive(True)
+            self.next_btn.set_sensitive(True)
+            dur = self.player.duration or track.get("duration", 0)
+            self.seek_scale.set_range(0, dur)
+            self.seek_scale.set_sensitive(True)
+            self.set_status(f"Playing: {track['title'][:50]}")
+            self.np_dur.set_label(fmt_dur(dur))
+            self._refresh_all_play_buttons()
+            tid = track["id"]
+            cancel = self.player._cancel
+            query = f"{track['uploader']} {track['title'][:30]}"
+            threading.Thread(target=lambda: GLib.idle_add(
+                self._show_recs, get_related(query, tid, 20, cancel=cancel)
+            ), daemon=True).start()
+        elif state == "failed":
+            self.stop_btn.set_sensitive(False)
+            self.like_btn.set_sensitive(False)
+            self.play_pause_btn.set_sensitive(False)
+            self.play_pause_btn.set_label("▶")
+            self.seek_scale.set_sensitive(False)
+            self.prev_btn.set_sensitive(False)
+            self.next_btn.set_sensitive(False)
+            self.set_status("Failed to get stream - try again")
+            self.np_dur.set_label("Failed")
+            self._refresh_all_play_buttons()
+        elif state == "stopped":
+            self.stop_btn.set_sensitive(False)
+            self.play_pause_btn.set_sensitive(False)
+            self.play_pause_btn.set_label("▶")
+            self.seek_scale.set_sensitive(False)
+            self.seek_scale.set_value(0)
+            self.time_label.set_label("0:00")
+            self.prev_btn.set_sensitive(False)
+            self.next_btn.set_sensitive(False)
+            self.set_status("Stopped")
+            self._refresh_all_play_buttons()
+        elif state == "ended":
+            if self.player.play_next_in_queue():
+                return
+            self.stop_btn.set_sensitive(False)
+            self.like_btn.set_sensitive(False)
+            self.play_pause_btn.set_sensitive(False)
+            self.play_pause_btn.set_label("▶")
+            self.seek_scale.set_sensitive(False)
+            self.seek_scale.set_value(0)
+            self.time_label.set_label("0:00")
+            self.prev_btn.set_sensitive(False)
+            self.next_btn.set_sensitive(False)
+            self.set_status("Playback ended")
+            self.np_dur.set_label("Finished")
+            self._refresh_all_play_buttons()
+
+    def _on_position_update(self, position):
+        if not self.player._seeking:
+            self.seek_scale.set_value(position)
+            self.time_label.set_label(fmt_dur(position))
+
+    def _toggle_play_pause(self):
+        paused = self.player.toggle_pause()
+        self.play_pause_btn.set_label("▶" if paused else "⏸")
+
+    def _on_seek(self, scale, scroll, value):
+        self.player._seeking = True
+        self.player.seek(value)
+        self.time_label.set_label(fmt_dur(value))
+        if self._seek_timeout:
+            GLib.source_remove(self._seek_timeout)
+        self._seek_timeout = GLib.timeout_add(500, self._clear_seeking)
+
+    def _clear_seeking(self):
+        self.player._seeking = False
+        self._seek_timeout = 0
+        return False
+
+    def _on_volume(self, scale, scroll, value):
+        self.player.set_volume(int(value))
+
+    def _refresh_all_play_buttons(self):
+        for d in (self._play_rows_res, self._play_rows_recs):
+            for tid, widgets in list(d.items()):
+                pb = widgets["play_btn"]
+                sl = widgets["state_label"]
+                pt = self.player.track
+                sl.remove_css_class("playing-label")
+                sl.remove_css_class("loading-label")
+                if pt and pt["id"] == tid and self.player.state == "playing":
+                    pb.set_visible(False)
+                    sl.set_text("▶ Playing"); sl.set_visible(True)
+                    sl.add_css_class("playing-label")
+                elif pt and pt["id"] == tid and self.player.state == "loading":
+                    pb.set_visible(False)
+                    sl.set_text("⟳ Loading"); sl.set_visible(True)
+                    sl.add_css_class("loading-label")
+                else:
+                    pb.set_visible(True)
+                    sl.set_visible(False)
+
+    # ── Search ──
+
+    def do_search(self):
+        q = self.search_entry.get_text().strip()
+        if not q:
+            return
+        self.set_status(f"Searching: {q}...")
+        threading.Thread(target=lambda: GLib.idle_add(self._show_results, search_yt(q), q), daemon=True).start()
+
+    def _show_results(self, results, query=""):
+        self.current_results = results
+        self.clear_list(self.results_list)
+        self.view_toolbar.set_visible(False)
+        if not results:
+            l = Gtk.Label(label="No results found"); l.set_margin_top(30)
+            self.results_list.append(l)
+            self.results_header.set_label("Results"); self.set_status("No results")
+            return
+        self.results_header.set_label(f"Results — {len(results)}")
+        self.set_status(f"Found {len(results)} tracks")
+        for i, t in enumerate(results):
+            self._add_result_row(t)
+            if i < 3:
+                threading.Thread(target=lambda v=t["id"]: get_stream_url(v), daemon=True).start()
+        self._refresh_all_play_buttons()
+
+    def _add_result_row(self, track, liked_override=None):
+        liked = liked_override if liked_override is not None else is_liked(track["id"])
+        row = Gtk.ListBoxRow(); row.set_selectable(False)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.set_margin_start(8); box.set_margin_end(8)
+        box.set_margin_top(6); box.set_margin_bottom(6)
+
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2); info.set_hexpand(True)
+
+        tl = Gtk.Label(label=track["title"])
+        tl.set_halign(Gtk.Align.START); tl.set_wrap(True); tl.set_max_width_chars(35)
+        tl.add_css_class("result-title"); info.append(tl)
+
+        dur = fmt_dur(track["duration"])
+        views = fmt_views(track.get("views",0))
+        sub = f"{track['uploader']}  •  {dur}" + (f"  •  {views}" if views else "")
+        sl = Gtk.Label(label=sub)
+        sl.set_halign(Gtk.Align.START); sl.add_css_class("result-sub"); info.append(sl)
+        box.append(info)
+
+        play_btn = Gtk.Button(label="▶ Play")
+        play_btn.add_css_class("play-btn")
+        play_btn.connect("clicked", lambda b, t=track: self.play_track(t))
+
+        state_label = Gtk.Label(label="")
+        state_label.set_visible(False)
+
+        self._play_rows_res[track["id"]] = {"play_btn": play_btn, "state_label": state_label}
+
+        box.append(play_btn)
+        box.append(state_label)
+
+        lb = Gtk.Button(label="♥" if liked else "♡")
+        lb.add_css_class("liked-btn" if liked else "like-btn")
+        lb.connect("clicked", lambda b, t=track, bx=box: self._toggle_result_like(t, bx))
+        box.append(lb)
+
+        row.set_child(box); self.results_list.append(row)
+
+    def _toggle_result_like(self, track, box):
+        liked = toggle_like(track)
+        for c in box:
+            if isinstance(c, Gtk.Button) and c.get_label() in ("♥","♡"):
+                c.set_label("♥" if liked else "♡")
+                c.remove_css_class("liked-btn"); c.remove_css_class("like-btn")
+                c.add_css_class("liked-btn" if liked else "like-btn")
+
+    def _toggle_like_current(self):
+        if not self.player.track:
+            return
+        liked = toggle_like(self.player.track)
+        self.like_btn.set_label("♥ Liked" if liked else "♡ Like")
+        self.like_btn.remove_css_class("liked-btn"); self.like_btn.remove_css_class("like-btn")
+        self.like_btn.add_css_class("liked-btn" if liked else "like-btn")
+
+    def _toggle_rec_like(self, track, btn):
+        liked = toggle_like(track)
+        btn.set_label("♥" if liked else "♡")
+        btn.remove_css_class("liked-btn"); btn.remove_css_class("like-btn")
+        btn.add_css_class("liked-btn" if liked else "like-btn")
+
+    # ── Playback ──
+
+    def play_track(self, track):
+        self.player.play(track)
+        self.current_track = track
+        liked = is_liked(track["id"])
+        self.np_title.set_label(track["title"])
+        self.np_artist.set_label(track["uploader"])
+        self.np_dur.set_label("Loading stream...")
+        self.like_btn.set_label("♥ Liked" if liked else "♡ Like")
+        self.like_btn.remove_css_class("liked-btn"); self.like_btn.remove_css_class("like-btn")
+        self.like_btn.add_css_class("liked-btn" if liked else "like-btn")
+        self.like_btn.set_sensitive(False)
+
+    def stop_playback(self):
+        self.player.stop()
+
+    def _prev_track(self):
+        if self.player.state == "playing":
+            self.player.seek(0)
+
+    def _next_track(self):
+        if self.player.queue:
+            self.player.play_next_in_queue()
+
+
+
+    # ── Recommendations ──
+
+    def _show_recs(self, recs):
+        self.current_recs = recs; self.clear_list(self.recs_list)
+        if not recs:
+            self.recs_header.set_label("Recommendations")
+            l = Gtk.Label(label="No recommendations"); l.set_margin_top(20)
+            self.recs_list.append(l)
+            return
+        self.recs_header.set_label(f"Recommendations — {len(recs)}")
+        for i, t in enumerate(recs):
+            row = Gtk.ListBoxRow(); row.set_selectable(False)
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            box.set_margin_start(6); box.set_margin_end(6)
+            box.set_margin_top(4); box.set_margin_bottom(4)
+
+            info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1); info.set_hexpand(True)
+            tc = t["title"][:38]+"..." if len(t["title"])>38 else t["title"]
+            tl = Gtk.Label(label=tc); tl.set_halign(Gtk.Align.START)
+            tl.set_wrap(True); tl.set_max_width_chars(30); tl.add_css_class("rec-title"); info.append(tl)
+            sl2 = Gtk.Label(label=f"{t['uploader']}  •  {fmt_dur(t['duration'])}")
+            sl2.set_halign(Gtk.Align.START); sl2.add_css_class("rec-sub"); info.append(sl2)
+            box.append(info)
+
+            play_btn = Gtk.Button(label="▶")
+            play_btn.add_css_class("play-btn")
+            play_btn.connect("clicked", lambda b, t=t: self.play_track(t))
+
+            state_label = Gtk.Label(label="")
+            state_label.set_visible(False)
+
+            self._play_rows_recs[t["id"]] = {"play_btn": play_btn, "state_label": state_label}
+            box.append(play_btn)
+            box.append(state_label)
+
+            liked = is_liked(t["id"])
+            lb = Gtk.Button(label="♥" if liked else "♡")
+            lb.add_css_class("liked-btn" if liked else "like-btn")
+            lb.set_margin_start(2)
+            lb.connect("clicked", lambda b, t=t: self._toggle_rec_like(t, b))
+            box.append(lb)
+
+            row.set_child(box); self.recs_list.append(row)
+
+            if i < 3:
+                threading.Thread(target=lambda v=t["id"]: get_stream_url(v), daemon=True).start()
+
+        self._refresh_all_play_buttons()
+
+    # ── Liked view ──
+
+    def show_liked(self):
+        self.liked_tracks = load_liked(); self.clear_list(self.results_list)
+        if not self.liked_tracks:
+            self.view_toolbar.set_visible(False)
+            self.results_header.set_label("♥ Liked Songs")
+            l = Gtk.Label(label="No liked songs yet.\nClick ♡ on any track to save it.")
+            l.set_margin_top(40); self.results_list.append(l)
+            self.set_status("0 liked songs"); return
+        self.view_toolbar.set_visible(True)
+        self.results_header.set_label(f"♥ Liked Songs — {len(self.liked_tracks)}")
+        self.set_status(f"{len(self.liked_tracks)} liked songs")
+        for t in self.liked_tracks:
+            self._add_result_row(t, liked_override=True)
+        self._refresh_all_play_buttons()
+
+    # ── Play All / Shuffle ──
+
+    def _play_all_liked(self):
+        tracks = load_liked()
+        if not tracks:
+            self.set_status("No liked songs to play")
+            return
+        self.player.set_queue(tracks[1:])
+        self.play_track(tracks[0])
+
+    def _shuffle_liked(self):
+        tracks = load_liked()
+        if not tracks:
+            self.set_status("No liked songs to shuffle")
+            return
+        shuffled = list(tracks)
+        random.shuffle(shuffled)
+        self.player.set_queue(shuffled[1:])
+        self.play_track(shuffled[0])
+
+
+def main():
+    db = os.path.expanduser("~/.deno/bin")
+    if db not in os.environ.get("PATH",""):
+        os.environ["PATH"] = db + ":" + os.environ.get("PATH","")
+    app = YMusicApp()
+    app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    main()

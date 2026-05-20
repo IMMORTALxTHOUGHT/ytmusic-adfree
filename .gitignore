@@ -1,0 +1,5 @@
+*.sock
+.cache/
+liked.json
+__pycache__/
+*.pyc

@@ -38,7 +38,10 @@ Or move it to your PATH:
 ```bash
 cp ymusic ~/.local/bin/
 ```
-
+for macOS requirements
+```bash
+brew install python3 gtk4 mpv yt-dlp deno pygobject3
+```
 ## Usage
 
 | Action             | Description                          |
